@@ -183,7 +183,6 @@ CHAT_PAGE_HTML = """<!doctype html>
 
       .field-grid {
         display: grid;
-        grid-template-columns: minmax(160px, 0.42fr) minmax(0, 1fr);
         gap: 12px;
       }
 
@@ -424,10 +423,6 @@ CHAT_PAGE_HTML = """<!doctype html>
         <form id="chat-form">
           <div class="field-grid">
             <label>
-              <span>Nickname</span>
-              <input id="nickname" name="nickname" maxlength="40" autocomplete="nickname" placeholder="student-1" required />
-            </label>
-            <label>
               <span>Question</span>
               <textarea id="question" name="question" maxlength="2000" placeholder="How do I verify this Render deployment?" required></textarea>
             </label>
@@ -489,10 +484,20 @@ CHAT_PAGE_HTML = """<!doctype html>
       const form = document.getElementById("chat-form");
       const chatLog = document.getElementById("chat-log");
       const statusEl = document.getElementById("status");
-      const nicknameEl = document.getElementById("nickname");
       const questionEl = document.getElementById("question");
       const sendButton = document.getElementById("send-button");
       const emptyState = document.getElementById("empty-state");
+      const clientIdKey = "browser-client-id";
+
+      function getClientId() {
+        const existing = window.localStorage.getItem(clientIdKey);
+        if (existing) {
+          return existing;
+        }
+        const generated = `browser-${crypto.randomUUID()}`;
+        window.localStorage.setItem(clientIdKey, generated);
+        return generated;
+      }
 
       function appendMessage(role, content) {
         if (emptyState) {
@@ -512,7 +517,13 @@ CHAT_PAGE_HTML = """<!doctype html>
           const state = row.querySelector(".state");
           try {
             const response = await fetch(path, { cache: "no-store" });
-            state.textContent = response.ok ? "ok" : `HTTP ${response.status}`;
+            let detail = "";
+            const contentType = response.headers.get("content-type") || "";
+            if (!response.ok && contentType.includes("application/json")) {
+              const payload = await response.json();
+              detail = payload.detail ? `: ${payload.detail}` : "";
+            }
+            state.textContent = response.ok ? "ok" : `HTTP ${response.status}${detail}`;
             state.className = response.ok ? "state ok" : "state fail";
           } catch (error) {
             state.textContent = "offline";
@@ -526,7 +537,7 @@ CHAT_PAGE_HTML = """<!doctype html>
         statusEl.textContent = "Waiting for model response...";
         sendButton.disabled = true;
 
-        const nickname = nicknameEl.value.trim();
+        const client_id = getClientId();
         const question = questionEl.value.trim();
         appendMessage("user", question);
 
@@ -534,7 +545,7 @@ CHAT_PAGE_HTML = """<!doctype html>
           const response = await fetch("/web/ask", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ nickname, question }),
+            body: JSON.stringify({ client_id, question }),
           });
           const payload = await response.json();
           if (!response.ok) {
@@ -559,8 +570,8 @@ CHAT_PAGE_HTML = """<!doctype html>
 """
 
 
-def normalize_nickname(value: str) -> str:
+def normalize_client_id(value: str) -> str:
     cleaned = value.strip().lower()
     cleaned = re.sub(r"[^a-z0-9_-]+", "-", cleaned)
     cleaned = cleaned.strip("-")
-    return cleaned[:40]
+    return cleaned[:80]

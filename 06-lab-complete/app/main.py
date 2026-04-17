@@ -26,7 +26,7 @@ from app.config import Settings, settings as default_settings
 from app.cost_guard import RedisCostGuard
 from app.openai_client import build_llm
 from app.rate_limiter import RedisRateLimiter
-from app.web_ui import CHAT_PAGE_HTML, normalize_nickname
+from app.web_ui import CHAT_PAGE_HTML, normalize_client_id
 
 
 logger = logging.getLogger("day12.part6")
@@ -90,15 +90,15 @@ class AskResponse(BaseModel):
 
 
 class WebAskRequest(BaseModel):
-    nickname: str = Field(..., min_length=1, max_length=40)
+    client_id: str = Field(..., min_length=1, max_length=80)
     question: str = Field(..., min_length=1, max_length=2000)
 
-    @field_validator("nickname")
+    @field_validator("client_id")
     @classmethod
-    def nickname_must_normalize(cls, value: str) -> str:
-        normalized = normalize_nickname(value)
+    def client_id_must_normalize(cls, value: str) -> str:
+        normalized = normalize_client_id(value)
         if not normalized:
-            raise ValueError("Nickname is required")
+            raise ValueError("Client ID is required")
         return value
 
 
@@ -311,7 +311,7 @@ def create_app(
 
     @app.post("/web/ask", response_model=AskResponse)
     async def ask_from_web(body: WebAskRequest):
-        user_id = normalize_nickname(body.nickname)
+        user_id = normalize_client_id(body.client_id)
         result = chat_service.ask(user_id=user_id, question=body.question)
         log_event(
             "web_agent_answered",

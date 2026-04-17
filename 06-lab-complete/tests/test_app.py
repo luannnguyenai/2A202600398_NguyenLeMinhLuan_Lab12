@@ -88,33 +88,34 @@ def test_root_serves_public_chat_html():
     assert "Render deploy console" in response.text
     assert "OpenAI model gateway" in response.text
     assert 'id="service-checks"' in response.text
-    assert 'name="nickname"' in response.text
+    assert 'name="nickname"' not in response.text
+    assert "browser-client-id" in response.text
     assert 'id="chat-form"' in response.text
 
 
-def test_web_ask_works_without_api_key_and_persists_history():
+def test_web_ask_uses_browser_client_id_without_api_key_and_persists_history():
     with build_client() as client:
         first = client.post(
             "/web/ask",
-            json={"nickname": "Alice", "question": "hello"},
+            json={"client_id": "browser-abc-123", "question": "hello"},
         )
         second = client.post(
             "/web/ask",
-            json={"nickname": "Alice", "question": "again"},
+            json={"client_id": "browser-abc-123", "question": "again"},
         )
 
     assert first.status_code == 200
     assert second.status_code == 200
-    assert first.json()["user_id"] == "alice"
+    assert first.json()["user_id"] == "browser-abc-123"
     assert second.json()["history_length"] == 4
     assert second.json()["answer"] == "echo:again|turns:3"
 
 
-def test_web_ask_rejects_blank_nickname():
+def test_web_ask_rejects_blank_client_id():
     with build_client() as client:
         response = client.post(
             "/web/ask",
-            json={"nickname": "   ", "question": "hello"},
+            json={"client_id": "   ", "question": "hello"},
         )
 
     assert response.status_code == 422
@@ -221,7 +222,7 @@ def test_provider_usage_tokens_are_preferred_when_available():
     with TestClient(app) as client:
         response = client.post(
             "/web/ask",
-            json={"nickname": "alice", "question": "hello"},
+            json={"client_id": "browser-abc-123", "question": "hello"},
         )
 
     assert response.status_code == 200
@@ -237,7 +238,7 @@ def test_web_ask_maps_provider_failures_to_503():
     ) as client:
         response = client.post(
             "/web/ask",
-            json={"nickname": "alice", "question": "hello"},
+            json={"client_id": "browser-abc-123", "question": "hello"},
         )
 
     assert response.status_code == 503

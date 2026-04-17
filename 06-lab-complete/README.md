@@ -110,7 +110,7 @@ Kỳ vọng: `/health` và `/ready` trả `200`. Nếu `/ready` trả `503`, Red
 ```bash
 curl -i -X POST http://localhost:8080/web/ask \
   -H "Content-Type: application/json" \
-  -d '{"nickname":"alice","question":"What should I verify before deploying to Render?"}'
+  -d '{"client_id":"browser-local-test","question":"What should I verify before deploying to Render?"}'
 ```
 
 Kỳ vọng:
@@ -315,7 +315,7 @@ Public chat:
 ```bash
 curl -i -X POST https://your-service.onrender.com/web/ask \
   -H "Content-Type: application/json" \
-  -d '{"nickname":"render-test","question":"What is this deployment running on?"}'
+  -d '{"client_id":"browser-render-test","question":"What is this deployment running on?"}'
 ```
 
 Protected API:
