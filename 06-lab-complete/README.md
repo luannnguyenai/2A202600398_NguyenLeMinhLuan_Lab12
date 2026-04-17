@@ -1,7 +1,5 @@
 # Lab 12 — Part 6 Final Project
 
-`06-lab-complete` là bản production-ready của lab: FastAPI, Docker, Redis, rate limit, budget guard, metrics, tracing, giao diện web mới và cấu hình deploy lên Render.
-
 ## Điểm chính
 
 - Public dashboard chat tại `GET /`
