@@ -38,9 +38,17 @@ def run_checks():
                          os.path.exists(os.path.join(base, ".env.example"))))
     results.append(check("requirements.txt exists",
                          os.path.exists(os.path.join(base, "requirements.txt"))))
-    results.append(check("railway.toml or render.yaml exists",
-                         os.path.exists(os.path.join(base, "railway.toml")) or
+    results.append(check("render.yaml exists",
                          os.path.exists(os.path.join(base, "render.yaml"))))
+    results.append(check("nginx.conf exists",
+                         os.path.exists(os.path.join(base, "nginx.conf"))))
+    render_file = os.path.join(base, "render.yaml")
+    if os.path.exists(render_file):
+        render_content = open(render_file).read()
+        results.append(check("Render health check uses /ready",
+                             "healthCheckPath: /ready" in render_content))
+        results.append(check("Render uses OpenAI API key",
+                             "OPENAI_API_KEY" in render_content and "OPENAI_MODEL" in render_content))
 
     # ── Security ──────────────────────────────────���
     print("\n🔒 Security")
@@ -63,7 +71,7 @@ def run_checks():
 
     # Check no hardcoded secrets in code
     secrets_found = []
-    for f in ["app/main.py", "app/config.py"]:
+    for f in ["app/main.py", "app/config.py", "app/openai_client.py"]:
         fpath = os.path.join(base, f)
         if os.path.exists(fpath):
             content = open(fpath).read()
@@ -77,12 +85,16 @@ def run_checks():
     # ── API Endpoints ────────────────────────────��─
     print("\n🌐 API Endpoints (code check)")
     main_py = os.path.join(base, "app", "main.py")
+    chat_service_py = os.path.join(base, "app", "chat_service.py")
     if os.path.exists(main_py):
         content = open(main_py).read()
+        chat_service_content = open(chat_service_py).read() if os.path.exists(chat_service_py) else ""
         results.append(check("/health endpoint defined",
                              '"/health"' in content or "'/health'" in content))
         results.append(check("/ready endpoint defined",
                              '"/ready"' in content or "'/ready'" in content))
+        results.append(check("/metrics endpoint defined",
+                             '"/metrics"' in content or "'/metrics'" in content))
         results.append(check("Authentication implemented",
                              "api_key" in content.lower() or "verify_token" in content))
         results.append(check("Rate limiting implemented",
@@ -91,8 +103,29 @@ def run_checks():
                              "SIGTERM" in content))
         results.append(check("Structured logging (JSON)",
                              "json.dumps" in content or '"event"' in content))
+        results.append(check("Redis-backed conversation history",
+                             ("history:" in content and "redis" in content.lower()) or
+                             ("history_with_question" in chat_service_content and "self.redis" in chat_service_content)))
+        results.append(check("Cost-optimized model context",
+                             "model_context_messages" in content or "model_context_messages" in chat_service_content))
+        results.append(check("OpenTelemetry tracing enabled",
+                             "opentelemetry" in content.lower() or "trace_id" in content))
+        config_py = os.path.join(base, "app", "config.py")
+        openai_client_py = os.path.join(base, "app", "openai_client.py")
+        config_content = open(config_py).read() if os.path.exists(config_py) else ""
+        openai_content = open(openai_client_py).read() if os.path.exists(openai_client_py) else ""
+        results.append(check("OpenAI provider configured",
+                             "OPENAI_API_KEY" in config_content and "/responses" in openai_content))
     else:
         results.append(check("app/main.py exists", False, "Create app/main.py!"))
+
+    for module_name in ["auth.py", "rate_limiter.py", "cost_guard.py"]:
+        results.append(check(
+            f"app/{module_name} exists",
+            os.path.exists(os.path.join(base, "app", module_name))
+        ))
+    results.append(check("app/openai_client.py exists",
+                         os.path.exists(os.path.join(base, "app", "openai_client.py"))))
 
     # ── Docker ─────────────────────────────────────
     print("\n🐳 Docker")
@@ -115,6 +148,18 @@ def run_checks():
                              ".env" in content))
         results.append(check(".dockerignore covers __pycache__",
                              "__pycache__" in content))
+
+    compose_file = os.path.join(base, "docker-compose.yml")
+    if os.path.exists(compose_file):
+        content = open(compose_file).read()
+        results.append(check("docker-compose includes redis",
+                             "redis:" in content))
+        results.append(check("docker-compose includes nginx",
+                             "nginx:" in content))
+        results.append(check("docker-compose includes prometheus",
+                             "prometheus:" in content))
+        results.append(check("docker-compose agent healthcheck uses /ready",
+                             "/ready" in content))
 
     # ── Summary ───────────────────────────────────���
     passed = sum(1 for r in results if r["passed"])

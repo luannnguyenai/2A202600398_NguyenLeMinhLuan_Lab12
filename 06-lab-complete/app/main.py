@@ -1,285 +1,355 @@
-"""
-Production AI Agent — Kết hợp tất cả Day 12 concepts
+from __future__ import annotations
 
-Checklist:
-  ✅ Config từ environment (12-factor)
-  ✅ Structured JSON logging
-  ✅ API Key authentication
-  ✅ Rate limiting
-  ✅ Cost guard
-  ✅ Input validation (Pydantic)
-  ✅ Health check + Readiness probe
-  ✅ Graceful shutdown
-  ✅ Security headers
-  ✅ CORS
-  ✅ Error handling
-"""
-import os
-import time
-import signal
-import logging
 import json
-from datetime import datetime, timezone
-from collections import defaultdict, deque
+import logging
+import signal
+import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Security, Depends, Request, Response
-from fastapi.security.api_key import APIKeyHeader
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Counter, Histogram, generate_latest
+import redis
 import uvicorn
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field, field_validator
 
-from app.config import settings
-
-# Mock LLM (thay bằng OpenAI/Anthropic khi có API key)
-from utils.mock_llm import ask as llm_ask
-
-# ─────────────────────────────────────────────────────────
-# Logging — JSON structured
-# ─────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.DEBUG if settings.debug else logging.INFO,
-    format='{"ts":"%(asctime)s","lvl":"%(levelname)s","msg":"%(message)s"}',
-)
-logger = logging.getLogger(__name__)
-
-START_TIME = time.time()
-_is_ready = False
-_request_count = 0
-_error_count = 0
-
-# ─────────────────────────────────────────────────────────
-# Simple In-memory Rate Limiter
-# ─────────────────────────────────────────────────────────
-_rate_windows: dict[str, deque] = defaultdict(deque)
-
-def check_rate_limit(key: str):
-    now = time.time()
-    window = _rate_windows[key]
-    while window and window[0] < now - 60:
-        window.popleft()
-    if len(window) >= settings.rate_limit_per_minute:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: {settings.rate_limit_per_minute} req/min",
-            headers={"Retry-After": "60"},
-        )
-    window.append(now)
-
-# ─────────────────────────────────────────────────────────
-# Simple Cost Guard
-# ─────────────────────────────────────────────────────────
-_daily_cost = 0.0
-_cost_reset_day = time.strftime("%Y-%m-%d")
-
-def check_and_record_cost(input_tokens: int, output_tokens: int):
-    global _daily_cost, _cost_reset_day
-    today = time.strftime("%Y-%m-%d")
-    if today != _cost_reset_day:
-        _daily_cost = 0.0
-        _cost_reset_day = today
-    if _daily_cost >= settings.daily_budget_usd:
-        raise HTTPException(503, "Daily budget exhausted. Try tomorrow.")
-    cost = (input_tokens / 1000) * 0.00015 + (output_tokens / 1000) * 0.0006
-    _daily_cost += cost
-
-# ─────────────────────────────────────────────────────────
-# Auth
-# ─────────────────────────────────────────────────────────
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-def verify_api_key(api_key: str = Security(api_key_header)) -> str:
-    if not api_key or api_key != settings.agent_api_key:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or missing API key. Include header: X-API-Key: <key>",
-        )
-    return api_key
-
-# ─────────────────────────────────────────────────────────
-# Lifespan
-# ─────────────────────────────────────────────────────────
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _is_ready
-    logger.info(json.dumps({
-        "event": "startup",
-        "app": settings.app_name,
-        "version": settings.app_version,
-        "environment": settings.environment,
-    }))
-    time.sleep(0.1)  # simulate init
-    _is_ready = True
-    logger.info(json.dumps({"event": "ready"}))
-
-    yield
-
-    _is_ready = False
-    logger.info(json.dumps({"event": "shutdown"}))
-
-# ─────────────────────────────────────────────────────────
-# App
-# ─────────────────────────────────────────────────────────
-app = FastAPI(
-    title=settings.app_name,
-    version=settings.app_version,
-    lifespan=lifespan,
-    docs_url="/docs" if settings.environment != "production" else None,
-    redoc_url=None,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.allowed_origins,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
-)
-
-@app.middleware("http")
-async def request_middleware(request: Request, call_next):
-    global _request_count, _error_count
-    start = time.time()
-    _request_count += 1
-    try:
-        response: Response = await call_next(request)
-        # Security headers
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers.pop("server", None)
-        duration = round((time.time() - start) * 1000, 1)
-        logger.info(json.dumps({
-            "event": "request",
-            "method": request.method,
-            "path": request.url.path,
-            "status": response.status_code,
-            "ms": duration,
-        }))
-        return response
-    except Exception as e:
-        _error_count += 1
-        raise
-
-# ─────────────────────────────────────────────────────────
-# Models
-# ─────────────────────────────────────────────────────────
-class AskRequest(BaseModel):
-    question: str = Field(..., min_length=1, max_length=2000,
-                          description="Your question for the agent")
-
-class AskResponse(BaseModel):
-    question: str
-    answer: str
-    model: str
-    timestamp: str
-
-# ─────────────────────────────────────────────────────────
-# Endpoints
-# ─────────────────────────────────────────────────────────
-
-@app.get("/", tags=["Info"])
-def root():
-    return {
-        "app": settings.app_name,
-        "version": settings.app_version,
-        "environment": settings.environment,
-        "endpoints": {
-            "ask": "POST /ask (requires X-API-Key)",
-            "health": "GET /health",
-            "ready": "GET /ready",
-        },
-    }
+from app.auth import build_api_key_dependency
+from app.chat_service import ChatService
+from app.config import Settings, settings as default_settings
+from app.cost_guard import RedisCostGuard
+from app.openai_client import build_llm
+from app.rate_limiter import RedisRateLimiter
+from app.web_ui import CHAT_PAGE_HTML, normalize_nickname
 
 
-@app.post("/ask", response_model=AskResponse, tags=["Agent"])
-async def ask_agent(
-    body: AskRequest,
-    request: Request,
-    _key: str = Depends(verify_api_key),
-):
-    """
-    Send a question to the AI agent.
+logger = logging.getLogger("day12.part6")
 
-    **Authentication:** Include header `X-API-Key: <your-key>`
-    """
-    # Rate limit per API key
-    check_rate_limit(_key[:8])  # use first 8 chars as key bucket
 
-    # Budget check
-    input_tokens = len(body.question.split()) * 2
-    check_and_record_cost(input_tokens, 0)
-
-    logger.info(json.dumps({
-        "event": "agent_call",
-        "q_len": len(body.question),
-        "client": str(request.client.host) if request.client else "unknown",
-    }))
-
-    answer = llm_ask(body.question)
-
-    output_tokens = len(answer.split()) * 2
-    check_and_record_cost(0, output_tokens)
-
-    return AskResponse(
-        question=body.question,
-        answer=answer,
-        model=settings.llm_model,
-        timestamp=datetime.now(timezone.utc).isoformat(),
+def configure_logging(log_level: str):
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper(), logging.INFO),
+        format="%(message)s",
+        force=True,
     )
 
 
-@app.get("/health", tags=["Operations"])
-def health():
-    """Liveness probe. Platform restarts container if this fails."""
-    status = "ok"
-    checks = {"llm": "mock" if not settings.openai_api_key else "openai"}
-    return {
-        "status": status,
-        "version": settings.app_version,
-        "environment": settings.environment,
-        "uptime_seconds": round(time.time() - START_TIME, 1),
-        "total_requests": _request_count,
-        "checks": checks,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+def log_event(event: str, **fields):
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        **fields,
     }
+    logger.info(json.dumps(payload, ensure_ascii=True))
 
 
-@app.get("/ready", tags=["Operations"])
-def ready():
-    """Readiness probe. Load balancer stops routing here if not ready."""
-    if not _is_ready:
-        raise HTTPException(503, "Not ready")
-    return {"ready": True}
+def configure_tracing(app_settings: Settings):
+    current_provider = trace.get_tracer_provider()
+    if not isinstance(current_provider, TracerProvider):
+        provider = TracerProvider(
+            resource=Resource.create(
+                {
+                    "service.name": app_settings.otel_service_name,
+                    "service.version": app_settings.app_version,
+                    "deployment.environment": app_settings.environment,
+                }
+            )
+        )
+        if app_settings.otel_exporter_otlp_endpoint:
+            provider.add_span_processor(
+                BatchSpanProcessor(
+                    OTLPSpanExporter(endpoint=app_settings.otel_exporter_otlp_endpoint)
+                )
+            )
+        elif app_settings.otel_exporter_console:
+            provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+        trace.set_tracer_provider(provider)
+    return trace.get_tracer(app_settings.otel_service_name)
 
 
-@app.get("/metrics", tags=["Operations"])
-def metrics(_key: str = Depends(verify_api_key)):
-    """Basic metrics (protected)."""
-    return {
-        "uptime_seconds": round(time.time() - START_TIME, 1),
-        "total_requests": _request_count,
-        "error_count": _error_count,
-        "daily_cost_usd": round(_daily_cost, 4),
-        "daily_budget_usd": settings.daily_budget_usd,
-        "budget_used_pct": round(_daily_cost / settings.daily_budget_usd * 100, 1),
-    }
+class AskRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=100)
+    question: str = Field(..., min_length=1, max_length=2000)
 
 
-# ─────────────────────────────────────────────────────────
-# Graceful Shutdown
-# ─────────────────────────────────────────────────────────
+class AskResponse(BaseModel):
+    user_id: str
+    question: str
+    answer: str
+    history_length: int
+    served_by: str
+    model: str
+    timestamp: str
+    usage: dict[str, float | int]
+
+
+class WebAskRequest(BaseModel):
+    nickname: str = Field(..., min_length=1, max_length=40)
+    question: str = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("nickname")
+    @classmethod
+    def nickname_must_normalize(cls, value: str) -> str:
+        normalized = normalize_nickname(value)
+        if not normalized:
+            raise ValueError("Nickname is required")
+        return value
+
+
+def create_redis_client(redis_url: str):
+    return redis.from_url(redis_url, decode_responses=True)
+
+
+def load_history(redis_client, user_id: str) -> list[dict]:
+    raw_value = redis_client.get(f"history:{user_id}")
+    if not raw_value:
+        return []
+    return json.loads(raw_value)
+
+
+def save_history(
+    redis_client,
+    user_id: str,
+    history: list[dict],
+    *,
+    ttl_seconds: int,
+):
+    redis_client.setex(f"history:{user_id}", ttl_seconds, json.dumps(history))
+
+
+def create_app(
+    *,
+    settings: Settings | None = None,
+    redis_client=None,
+    llm_func=None,
+) -> FastAPI:
+    app_settings = settings or default_settings
+    configure_logging(app_settings.log_level)
+    redis_conn = redis_client or create_redis_client(app_settings.redis_url)
+    llm = llm_func or build_llm(app_settings)
+    tracer = configure_tracing(app_settings)
+    rate_limiter = RedisRateLimiter(
+        redis_conn,
+        max_requests=app_settings.rate_limit_per_minute,
+        window_seconds=60,
+    )
+    cost_guard = RedisCostGuard(
+        redis_conn,
+        monthly_budget_usd=app_settings.monthly_budget_usd,
+    )
+    verify_api_key = build_api_key_dependency(app_settings.agent_api_key)
+    start_time = time.time()
+    metrics_registry = CollectorRegistry()
+    http_requests_total = Counter(
+        "agent_http_requests_total",
+        "Total HTTP requests served by the agent",
+        ["method", "path", "status"],
+        registry=metrics_registry,
+    )
+    http_request_duration = Histogram(
+        "agent_http_request_duration_seconds",
+        "Request latency in seconds",
+        ["method", "path"],
+        registry=metrics_registry,
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.ready = False
+        try:
+            redis_conn.ping()
+            app.state.ready = True
+            log_event(
+                "startup",
+                app=app_settings.app_name,
+                version=app_settings.app_version,
+                environment=app_settings.environment,
+                instance_id=app_settings.instance_id,
+            )
+        except Exception as exc:
+            app.state.ready = False
+            log_event("startup_failed", error=str(exc))
+        yield
+        app.state.ready = False
+        log_event("shutdown", instance_id=app_settings.instance_id)
+
+    app = FastAPI(
+        title=app_settings.app_name,
+        version=app_settings.app_version,
+        lifespan=lifespan,
+        docs_url="/docs" if app_settings.environment != "production" else None,
+        redoc_url=None,
+    )
+    app.state.settings = app_settings
+    app.state.redis = redis_conn
+    app.state.rate_limiter = rate_limiter
+    app.state.cost_guard = cost_guard
+    chat_service = ChatService(
+        settings=app_settings,
+        redis_client=redis_conn,
+        rate_limiter=rate_limiter,
+        cost_guard=cost_guard,
+        llm_func=llm,
+        load_history=load_history,
+        save_history=save_history,
+    )
+    app.state.chat_service = chat_service
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=app_settings.allowed_origins,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "X-API-Key"],
+    )
+
+    @app.middleware("http")
+    async def request_middleware(request: Request, call_next):
+        started_at = time.time()
+        with tracer.start_as_current_span(f"{request.method} {request.url.path}") as span:
+            span.set_attribute("http.method", request.method)
+            span.set_attribute("http.route", request.url.path)
+            try:
+                response: Response = await call_next(request)
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_attribute("http.status_code", 500)
+                log_event("request_failed", path=request.url.path, method=request.method)
+                raise
+
+            duration_seconds = time.time() - started_at
+            duration_ms = round(duration_seconds * 1000, 1)
+            span.set_attribute("http.status_code", response.status_code)
+            trace_id = format(span.get_span_context().trace_id, "032x")
+            response.headers["X-Trace-Id"] = trace_id
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Cache-Control"] = "no-store"
+            http_requests_total.labels(
+                method=request.method,
+                path=request.url.path,
+                status=str(response.status_code),
+            ).inc()
+            http_request_duration.labels(
+                method=request.method,
+                path=request.url.path,
+            ).observe(duration_seconds)
+            log_event(
+                "request",
+                method=request.method,
+                path=request.url.path,
+                status=response.status_code,
+                duration_ms=duration_ms,
+                trace_id=trace_id,
+            )
+            return response
+
+    @app.get("/", response_class=HTMLResponse)
+    def root():
+        return HTMLResponse(CHAT_PAGE_HTML)
+
+    @app.get("/health")
+    def health():
+        return {
+            "status": "ok",
+            "instance_id": app_settings.instance_id,
+            "uptime_seconds": round(time.time() - start_time, 1),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    @app.get("/ready")
+    def ready():
+        try:
+            redis_conn.ping()
+        except Exception as exc:
+            app.state.ready = False
+            raise HTTPException(status_code=503, detail=f"Redis unavailable: {exc}")
+
+        if not app.state.ready:
+            raise HTTPException(status_code=503, detail="Application is not ready")
+
+        return {"ready": True, "instance_id": app_settings.instance_id}
+
+    @app.get("/metrics")
+    def metrics():
+        if not app_settings.prometheus_enabled:
+            raise HTTPException(status_code=404, detail="Prometheus metrics disabled")
+        return Response(
+            generate_latest(metrics_registry),
+            media_type=CONTENT_TYPE_LATEST,
+        )
+
+    @app.post("/ask", response_model=AskResponse)
+    async def ask_agent(
+        body: AskRequest,
+        _api_key: str = Depends(verify_api_key),
+    ):
+        result = chat_service.ask(user_id=body.user_id, question=body.question)
+        log_event(
+            "agent_answered",
+            user_id=result["user_id"],
+            history_length=result["history_length"],
+            context_messages_used=result["usage"]["context_messages_used"],
+            instance_id=app_settings.instance_id,
+        )
+
+        return AskResponse(
+            user_id=result["user_id"],
+            question=result["question"],
+            answer=result["answer"],
+            history_length=result["history_length"],
+            served_by=app_settings.instance_id,
+            model=app_settings.llm_model,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            usage=result["usage"],
+        )
+
+    @app.post("/web/ask", response_model=AskResponse)
+    async def ask_from_web(body: WebAskRequest):
+        user_id = normalize_nickname(body.nickname)
+        result = chat_service.ask(user_id=user_id, question=body.question)
+        log_event(
+            "web_agent_answered",
+            user_id=result["user_id"],
+            history_length=result["history_length"],
+            context_messages_used=result["usage"]["context_messages_used"],
+            instance_id=app_settings.instance_id,
+        )
+        return AskResponse(
+            user_id=result["user_id"],
+            question=result["question"],
+            answer=result["answer"],
+            history_length=result["history_length"],
+            served_by=app_settings.instance_id,
+            model=app_settings.llm_model,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            usage=result["usage"],
+        )
+
+    return app
+
+
+app = create_app()
+
+
 def _handle_signal(signum, _frame):
-    logger.info(json.dumps({"event": "signal", "signum": signum}))
+    log_event("signal", signum=signum)
+
 
 signal.signal(signal.SIGTERM, _handle_signal)
 
 
 if __name__ == "__main__":
-    logger.info(f"Starting {settings.app_name} on {settings.host}:{settings.port}")
-    logger.info(f"API Key: {settings.agent_api_key[:4]}****")
+    current_settings = default_settings
     uvicorn.run(
         "app.main:app",
-        host=settings.host,
-        port=settings.port,
-        reload=settings.debug,
+        host=current_settings.host,
+        port=current_settings.port,
+        reload=current_settings.debug,
         timeout_graceful_shutdown=30,
     )

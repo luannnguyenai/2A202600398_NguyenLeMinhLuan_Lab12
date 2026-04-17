@@ -66,7 +66,7 @@ python 3.11+
 docker & docker compose
 ```
 
-Mỗi folder có `requirements.txt` riêng. Không cần API key thật — các ví dụ dùng **mock LLM** để chạy offline.
+Mỗi folder có `requirements.txt` riêng. Các phần học trước vẫn có mock LLM để chạy offline; riêng `06-lab-complete` dùng `OPENAI_API_KEY` khi gọi model thật và có hướng dẫn deploy Render trong README của folder đó.
 
 ---
 
@@ -79,7 +79,7 @@ Mỗi folder có `requirements.txt` riêng. Không cần API key thật — các
 | 3 | `03-cloud-deployment` | Railway, Render, Cloud Run |
 | 4 | `04-api-gateway` | Auth, rate limiting, cost protection |
 | 5 | `05-scaling-reliability` | Health check, stateless, rolling deploy |
-| 6 | `06-lab-complete` | **Full production agent** |
+| 6 | `06-lab-complete` | **Full production agent: OpenAI + Redis + Render** |
 
 ---
 
